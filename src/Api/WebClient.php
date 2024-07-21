@@ -13,19 +13,29 @@ namespace BitBag\SyliusInPostPlugin\Api;
 use BitBag\SyliusInPostPlugin\Entity\InPostPoint;
 use BitBag\SyliusInPostPlugin\Model\InPostPointsAwareInterface;
 use BitBag\SyliusShippingExportPlugin\Entity\ShippingGatewayInterface;
-use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ClientException;
+use Http\Message\MessageFactory;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
+use GuzzleHttp\ClientInterface as DeprecatedClientInterface;
 use GuzzleHttp\Exception\GuzzleException;
+use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamFactoryInterface;
 use Sylius\Component\Core\Model\AddressInterface;
 use Sylius\Component\Core\Model\CustomerInterface;
 use Sylius\Component\Core\Model\OrderInterface;
 use Sylius\Component\Core\Model\ShipmentInterface;
 use Webmozart\Assert\Assert;
+use Nyholm\Psr7\Stream;
 
 final class WebClient implements WebClientInterface
 {
-    private Client $apiClient;
+    private MessageFactory|RequestFactoryInterface $requestFactory;
+
+    private ?StreamFactoryInterface $streamFactory;
+
+    private ClientInterface|DeprecatedClientInterface $apiClient;
 
     private ?string $organizationId = null;
 
@@ -37,8 +47,14 @@ final class WebClient implements WebClientInterface
 
     private string $labelType = 'normal';
 
-    public function __construct(Client $client, string $labelType)
-    {
+    public function __construct(
+        MessageFactory|RequestFactoryInterface $requestFactory,
+        ClientInterface|DeprecatedClientInterface $client,
+        string $labelType,
+        ?StreamFactoryInterface $streamFactory = null,
+    ) {
+        $this->requestFactory = $requestFactory;
+        $this->streamFactory = $streamFactory;
         $this->apiClient = $client;
         $this->labelType = $labelType;
     }
@@ -187,41 +203,6 @@ final class WebClient implements WebClientInterface
         ];
     }
 
-    /**
-     * @return mixed
-     *
-     * @throws GuzzleException
-     */
-    public function request(
-        string $method,
-        string $url,
-        array $data = [],
-        bool $returnJson = true
-    ) {
-        $options = [
-            'json' => $data,
-            'headers' => $this->getAuthorizedHeaderWithContentType(),
-        ];
-
-        try {
-            $result = $this->apiClient->request($method, $url, $options);
-        } catch (ClientException $exception) {
-            /** @var ?ResponseInterface $result */
-            $result = $exception->getResponse();
-
-            throw new ClientException(
-                null !== $result ? (string) $result->getBody() : 'Request failed for url' . $url,
-                $exception->getRequest()
-            );
-        }
-
-        if (false === $returnJson) {
-            return (string) $result->getBody();
-        }
-
-        return \GuzzleHttp\json_decode((string) $result->getBody(), true);
-    }
-
     private function getAdditionalServices(): array
     {
         $additionalServices = $this->getShippingGatewayConfig('additional_services');
@@ -349,5 +330,58 @@ final class WebClient implements WebClientInterface
         }
 
         return $comments;
+    }
+
+    /**
+     * @return mixed
+     *
+     * @throws GuzzleException
+     * @throws \JsonException
+     */
+    public function request(
+        string $method,
+        string $url,
+        array $data = [],
+        bool $returnJson = true
+    ) {
+        $headers = $this->getAuthorizedHeaderWithContentType();
+
+        $request = $this->requestFactory->createRequest($method, $url);
+
+        foreach ($headers as $key => $value) {
+            $request = $request->withHeader($key, $value);
+        }
+
+        $dataAsJson = \json_encode($data, JSON_THROW_ON_ERROR);
+
+        $request = $request->withBody(
+            null === $this->streamFactory
+                ? Stream::create($dataAsJson)
+                : $this->streamFactory->createStream($dataAsJson),
+        );
+
+        try {
+            if ($this->apiClient instanceof DeprecatedClientInterface) {
+                $result = $this->apiClient->send($request);
+            } else {
+                $result = $this->apiClient->sendRequest($request);
+            }
+        } catch (ClientExceptionInterface|ClientException $exception) {
+            /** @var ?ResponseInterface $result */
+            $result = $exception->getResponse();
+
+            throw new ClientException(
+                null !== $result ? (string) $result->getBody() : 'Request failed for url' . $url,
+                $exception->getRequest()
+            );
+        }
+
+        $resultAsJson = $result->getBody()->getContents();
+
+        if (false === $returnJson) {
+            return $resultAsJson;
+        }
+
+        return \json_decode($resultAsJson, true);
     }
 }
